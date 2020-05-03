@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,11 +30,17 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	bespb "github.com/bazelbuild/rules_go/go/tools/gopackagesdriver/proto/build_event_stream"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/tools/go/packages"
+)
+
+const (
+	bazelBin = "bazel"
 )
 
 func main() {
@@ -48,7 +55,7 @@ func main() {
 // on stdin. Keep in sync.
 type driverRequest struct {
 	Command    string            `json:"command"`
-	Mode       packages.LoadMode `json:"mode"`
+	cMode      packages.LoadMode `json:"mode"`
 	Env        []string          `json:"env"`
 	BuildFlags []string          `json:"build_flags"`
 	Tests      bool              `json:"tests"`
@@ -76,14 +83,19 @@ type driverResponse struct {
 }
 
 func run(args []string) error {
+	ctx := context.Background()
 	// Parse command line arguments and driver request sent on stdin.
 	fs := flag.NewFlagSet("gopackagesdriver", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	targets := fs.Args()
-	if len(targets) == 0 {
-		return errors.New("no targets specified")
+	directAndIndirectTargets, err := parseTargetsAndQueries(fs.Args())
+	if err != nil {
+		return err
+	}
+	targets, err := resolveTargets(ctx, directAndIndirectTargets)
+	if err != nil {
+		return err
 	}
 
 	reqData, err := ioutil.ReadAll(os.Stdin)
@@ -116,14 +128,16 @@ func run(args []string) error {
 		os.Remove(eventFileName)
 	}()
 
-	cmd := exec.Command("bazel", "build")
-	cmd.Args = append(cmd.Args, "--aspects="+aspect)
+	cmd := bazelCmd("build")
+	if aspect == "FIXMEDONOTSUBMIT" {
+		cmd.Args = append(cmd.Args, "--aspects="+aspect)
+	}
 	cmd.Args = append(cmd.Args, "--output_groups="+outputGroup)
 	cmd.Args = append(cmd.Args, "--build_event_binary_file="+eventFile.Name())
 	cmd.Args = append(cmd.Args, req.BuildFlags...)
 	cmd.Args = append(cmd.Args, "--")
 	for _, target := range targets {
-		cmd.Args = append(cmd.Args, target)
+		cmd.Args = append(cmd.Args, target...)
 	}
 	cmd.Stdout = os.Stderr // sic
 	cmd.Stderr = os.Stderr
@@ -137,64 +151,67 @@ func run(args []string) error {
 	}
 	eventFile.Close()
 
-	var rootSets []string
-	setToFiles := make(map[string][]string)
-	setToSets := make(map[string][]string)
+	var rootSets []namedSetOfFilesID
+	setToFiles := make(map[namedSetOfFilesID][]string)
+	setToSets := make(map[namedSetOfFilesID][]namedSetOfFilesID)
 	pbuf := proto.NewBuffer(eventData)
 	var event bespb.BuildEvent
+	eventCount, targetCompletedCount := 0, 0
 	for !event.GetLastMessage() {
 		if err := pbuf.DecodeMessage(&event); err != nil {
 			return err
 		}
-
+		eventCount++
 		if id := event.GetId().GetTargetCompleted(); id != nil {
+			targetCompletedCount++
 			completed := event.GetCompleted()
 			if !completed.GetSuccess() {
 				return fmt.Errorf("%s: target did not build successfully", id.GetLabel())
 			}
 			for _, g := range completed.GetOutputGroup() {
 				for _, s := range g.GetFileSets() {
-					if setId := s.GetId(); setId != "" {
-						rootSets = append(rootSets, setId)
+					if setID := makeNamedNamedSetOfFilesID(s); setID != "" {
+						rootSets = append(rootSets, setID)
 					}
 				}
 			}
 		}
 
-		if id := event.GetId().GetNamedSet(); id != nil {
-			files := event.GetNamedSetOfFiles().GetFiles()
-			fileNames := make([]string, len(files))
-			for i, f := range files {
-				fileNames[i] = f.GetName()
-			}
-			setToFiles[id.GetId()] = fileNames
-			sets := event.GetNamedSetOfFiles().GetFileSets()
-			setIds := make([]string, len(sets))
-			for i, s := range sets {
-				setIds[i] = s.GetId()
-			}
-			setToSets[id.GetId()] = setIds
+		id := makeNamedNamedSetOfFilesID(event.GetId().GetNamedSet())
+		if id == "" {
 			continue
 		}
+		files := event.GetNamedSetOfFiles().GetFiles()
+		fileNames := make([]string, len(files))
+		for i, f := range files {
+			fileNames[i] = f.GetName()
+		}
+		setToFiles[id] = fileNames
+		sets := event.GetNamedSetOfFiles().GetFileSets()
+		setIds := make([]namedSetOfFilesID, len(sets))
+		for i, s := range sets {
+			setIds[i] = makeNamedNamedSetOfFilesID(s)
+		}
+		setToSets[id] = setIds
 	}
 
-	var visit func(string, map[string]bool, map[string]bool)
-	visit = func(setId string, files map[string]bool, visited map[string]bool) {
-		if visited[setId] {
+	var visit func(namedSetOfFilesID, map[string]bool, map[namedSetOfFilesID]bool)
+	visit = func(setID namedSetOfFilesID, files map[string]bool, visited map[namedSetOfFilesID]bool) {
+		if visited[setID] {
 			return
 		}
-		visited[setId] = true
-		for _, f := range setToFiles[setId] {
+		visited[setID] = true
+		for _, f := range setToFiles[setID] {
 			files[f] = true
 		}
-		for _, s := range setToSets[setId] {
+		for _, s := range setToSets[setID] {
 			visit(s, files, visited)
 		}
 	}
 
 	files := make(map[string]bool)
 	for _, s := range rootSets {
-		visit(s, files, map[string]bool{})
+		visit(s, files, map[namedSetOfFilesID]bool{})
 	}
 	sortedFiles := make([]string, 0, len(files))
 	for f := range files {
@@ -206,7 +223,7 @@ func run(args []string) error {
 	pkgs := make(map[string]*packages.Package)
 	roots := make(map[string]bool)
 	for _, target := range targets {
-		panic(fmt.Sprintf("json processing not implemented: %s", target))
+		return (fmt.Errorf("JSON processing not implemented: %s; rootSets = %v; eventCount = %d, tcc = %d", target, rootSets, eventCount, targetCompletedCount))
 	}
 
 	sortedRoots := make([]string, 0, len(roots))
@@ -238,4 +255,115 @@ func run(args []string) error {
 	}
 
 	return errors.New("not implemented")
+}
+
+// namedSetOfFilesID is based on build_event_stream.BuildEvent.NamedSetOfFilesId
+// and exists keep operations more typesafe than if we were to use the
+// underlying string.
+//
+// corresponds to
+// https://cs.opensource.google/bazel/bazel/+/master:src/main/java/com/google/devtools/build/lib/buildeventstream/proto/build_event_stream.proto;l=108
+type namedSetOfFilesID string
+
+func makeNamedNamedSetOfFilesID(x *bespb.BuildEventId_NamedSetOfFilesId) namedSetOfFilesID {
+	return namedSetOfFilesID(x.GetId())
+}
+
+const (
+	fileQueryPrefix    = "file="
+	patternQueryPrefix = "query="
+)
+
+type targetOrQuery string
+
+func (t targetOrQuery) String() string {
+	return string(t)
+}
+
+func (t targetOrQuery) isBazelTarget() bool {
+	return t.fileQuery() == "" && t.patternQuery() == ""
+}
+
+// fileQuery returns the value to the right of '=' in a 'file=...' argument.
+//
+// file queries should be resolved using something like
+// https://docs.bazel.build/versions/master/query-how-to.html#What_build_rule_contains_file_ja
+func (t targetOrQuery) fileQuery() string {
+	if trimmed := strings.TrimPrefix(t.String(), fileQueryPrefix); trimmed != t.String() {
+		return trimmed
+	}
+	return ""
+}
+
+func (t targetOrQuery) patternQuery() string {
+	if trimmed := strings.TrimPrefix(t.String(), patternQueryPrefix); trimmed != t.String() {
+		return trimmed
+	}
+	return ""
+}
+
+func parseTargetsAndQueries(args []string) ([]targetOrQuery, error) {
+	if len(args) == 0 {
+		return nil, errors.New("no targets specified")
+	}
+	var out []targetOrQuery
+	for _, a := range args {
+		out = append(out, targetOrQuery(a))
+	}
+	return out, nil
+}
+
+func resolveTargets(ctx context.Context, args []targetOrQuery) ([][]string, error) {
+	resolvedLabels := make([][]string, len(args))
+	for i, a := range args {
+		if a.isBazelTarget() {
+			resolvedLabels[i] = []string{a.String()}
+			continue
+		}
+		if a.patternQuery() != "" {
+			return nil, fmt.Errorf("don't know how to handle pattern query argument %q", a)
+		}
+		targets, err := targetsWithSrcFile(ctx, a.fileQuery())
+		if err != nil {
+			return nil, err
+		}
+		resolvedLabels[i] = targets
+	}
+	return resolvedLabels, nil
+}
+
+func targetsWithSrcFile(ctx context.Context, sourceFile string) ([]string, error) {
+	if !strings.HasSuffix(sourceFile, ".go") {
+		return nil, fmt.Errorf("don't know how to handle non-go file %q", sourceFile)
+	}
+
+	// file queries should be resolved using something like
+	// https://docs.bazel.build/versions/master/query-how-to.html#What_build_rule_contains_file_ja
+	sourceFileTarget, err := srcFileTarget(ctx, sourceFile)
+	if err != nil {
+		return nil, fmt.Errorf("UNIMPLEMENTED handling of src files with no labels: gopackagesdriver could not find a corresponding bazel label for file=%s: %w", sourceFile, err)
+	}
+	sourceFileBazelPackage := strings.TrimSuffix(sourceFileTarget, fmt.Sprintf(":%s", filepath.Base(sourceFile)))
+
+	return []string{fmt.Sprintf("%s:all", sourceFileBazelPackage)}, nil
+}
+
+func srcFileTarget(ctx context.Context, src string) (string, error) {
+	// file queries should be resolved using something like
+	// https://docs.bazel.build/versions/master/query-how-to.html#What_build_rule_contains_file_ja
+	c := bazelCmd("query", src)
+	c.Stderr = os.Stderr
+	got, err := c.Output()
+	if err != nil {
+		return "", fmt.Errorf("unable to map source file %q to bazel label: %w", src, err)
+	}
+	lines := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+	if got, want := len(lines), 1; got != want {
+		return "", fmt.Errorf("maping source file %q to bazel label got %d label(s), want %d: %v", src, got, want, lines)
+	}
+	return lines[0], nil
+}
+
+func bazelCmd(arg ...string) *exec.Cmd {
+	return exec.Command(bazelBin, arg...)
 }
